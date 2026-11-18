@@ -1,0 +1,384 @@
+# Non-injecting macOS validation of @imxade/inject v0.2.0 for AOSSIE-Org/Rein #470.
+# Lives alone on the orphan branch `macos-validation`: it never checks out Rein code,
+# and push events only evaluate the workflow files present in the pushed commit.
+name: macOS validation (@imxade/inject v0.2.0)
+
+on:
+  push:
+    branches:
+      - macos-validation
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-validation
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Non-injecting validation (macos-26, arm64)
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      TARGET_REPOSITORY: imxade/inject
+      TARGET_SHA: b45f448e499d45ccabd3ef32a038fb09d6454605
+      EXPECTED_NODE_MAJOR: "22"
+      INJECT_DIR: ${{ github.workspace }}/inject
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+
+    steps:
+      # Written first so the report and evidence upload work even if a later hard gate fails.
+      - name: Prepare evidence directory and helper scripts
+        run: |
+          mkdir -p "$EVIDENCE_DIR/logs" "$EVIDENCE_DIR/scripts"
+          printf 'stage\tcheck\trequired\texit_code\tcommand\n' > "$EVIDENCE_DIR/results.tsv"
+
+          cat > "$RUNNER_TEMP/record.sh" <<'EOF'
+          # record STAGE CHECK REQUIRED(yes|no) CMD...
+          # Runs CMD, streams and saves its output, and appends the exit code to
+          # results.tsv without failing the step, so later stages still collect
+          # evidence. The final "Enforce" step fails the job on required failures.
+          record() {
+            local stage="$1" check="$2" required="$3"; shift 3
+            local log="$EVIDENCE_DIR/logs/${stage}-${check}.log"
+            local cmd="$*"
+            cmd="${cmd//$'\n'/ }"
+            cmd="${cmd//$'\t'/ }"
+            printf '$ %s\n' "$*" > "$log"
+            set +e
+            "$@" 2>&1 | tee -a "$log"
+            LAST_RC=${PIPESTATUS[0]}
+            set -e
+            printf 'exit code: %s\n' "$LAST_RC" >> "$log"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$stage" "$check" "$required" "$LAST_RC" "$cmd" >> "$EVIDENCE_DIR/results.tsv"
+            echo "[$stage/$check] exit code $LAST_RC (required: $required)"
+          }
+          # Hard gate: record, then stop the job immediately on failure.
+          require_pass() {
+            record "$1" "$2" yes "${@:3}"
+            if [ "$LAST_RC" != 0 ]; then
+              echo "::error::Hard gate $1/$2 failed (exit $LAST_RC)"
+              exit 1
+            fi
+          }
+          EOF
+
+          cat > "$RUNNER_TEMP/vitest-summary.mjs" <<'EOF'
+          // Summarises vitest JSON output and proves the native E2E suites stayed gated off.
+          import { readFileSync, writeFileSync } from "node:fs"
+          import path from "node:path"
+
+          const [inputFile, outputFile] = process.argv.slice(2)
+          const report = JSON.parse(readFileSync(inputFile, "utf8"))
+          const root = process.env.INJECT_DIR
+          const files = report.testResults.map((f) => ({
+            file: path.relative(root, f.name).split(path.sep).join("/"),
+            status: f.status,
+            tests: f.assertionResults.map((a) => ({ name: a.fullName, status: a.status })),
+          }))
+          const nativeFiles = files.filter((f) => f.file.startsWith("test/native/"))
+          const executedNative = nativeFiles.flatMap((f) =>
+            f.tests.filter((t) => t.status === "passed" || t.status === "failed").map((t) => `${f.file}: ${t.name} (${t.status})`),
+          )
+          const macosFile = nativeFiles.find((f) => f.file === "test/native/macos.e2e.test.ts")
+          const summary = {
+            success: report.success,
+            numTotalTestSuites: report.numTotalTestSuites,
+            numTotalTests: report.numTotalTests,
+            numPassedTests: report.numPassedTests,
+            numFailedTests: report.numFailedTests,
+            numPendingTests: report.numPendingTests,
+            numTodoTests: report.numTodoTests,
+            skippedTests: files.flatMap((f) =>
+              f.tests.filter((t) => t.status !== "passed" && t.status !== "failed").map((t) => ({
+                file: f.file,
+                name: t.name,
+                status: t.status,
+                reason: f.file.startsWith("test/native/")
+                  ? "describe.runIf gate: requires the native E2E opt-in variable and the matching platform (live input injection)"
+                  : "skipped by the test suite",
+              })),
+            ),
+            nativeE2E: {
+              macosFileCollected: Boolean(macosFile),
+              executedNativeTests: executedNative,
+            },
+            files,
+          }
+          writeFileSync(outputFile, `${JSON.stringify(summary, null, 2)}\n`)
+          console.log(JSON.stringify({ ...summary, files: undefined }, null, 2))
+          if (!macosFile) {
+            console.error("macOS native E2E file was not collected; cannot confirm its gate state")
+            process.exit(1)
+          }
+          if (executedNative.length > 0) {
+            console.error(`Native E2E tests executed despite the disabled gate:\n${executedNative.join("\n")}`)
+            process.exit(1)
+          }
+          EOF
+
+          cat > "$RUNNER_TEMP/smoke.mjs" <<'EOF'
+          // Non-injecting API smoke test. It never calls inject* or post* functions;
+          // the only native calls are CoreGraphics display-size queries.
+          import { writeFileSync } from "node:fs"
+          import path from "node:path"
+          import { pathToFileURL } from "node:url"
+
+          const outputFile = process.argv[2]
+          const load = (rel) => import(pathToFileURL(path.join(process.env.INJECT_DIR, "dist", rel)).href)
+          const EXPECTED_METHODS = ["destroy", "injectCombo", "injectKey", "injectMouseAbsolute", "injectMouseButton", "injectMouseWheel"]
+          const result = { platform: process.platform, arch: process.arch, node: process.version, steps: [] }
+          let ok = true
+
+          async function step(name, fn) {
+            try {
+              result.steps.push({ name, status: "PASS", value: await fn() })
+            } catch (error) {
+              ok = false
+              result.steps.push({ name, status: "FAIL", error: String(error?.stack ?? error) })
+            }
+          }
+
+          let pkg
+          let mac
+          let injector
+          await step("import package entry dist/index.js", async () => {
+            pkg = await load("index.js")
+            return Object.keys(pkg).sort()
+          })
+          await step("import macOS module dist/mac/index.js", async () => {
+            mac = await load("mac/index.js")
+            return Object.keys(mac).sort()
+          })
+          await step("loadNativeBackend('darwin') returns the macOS module", async () => {
+            const backend = await pkg.loadNativeBackend("darwin")
+            if (backend.getMainDisplaySize !== mac.getMainDisplaySize) {
+              throw new Error("loadNativeBackend('darwin') did not resolve dist/mac/index.js")
+            }
+            return true
+          })
+          await step("getMainDisplaySize() read-only CoreGraphics display query", async () => {
+            const size = mac.getMainDisplaySize()
+            const nonZero = size.width > 0 && size.height > 0
+            return { ...size, observation: nonZero ? "non-zero dimensions" : "zero dimension reported (recorded, not classified)" }
+          })
+          // createInjector('darwin') itself calls getMainDisplaySize() during construction.
+          await step("createInjector('darwin') construction", async () => {
+            injector = await pkg.createInjector("darwin")
+            return Object.keys(injector).sort()
+          })
+          await step("unified injector API shape (typeof only, no calls)", async () => {
+            const missing = EXPECTED_METHODS.filter((name) => typeof injector[name] !== "function")
+            if (missing.length > 0) throw new Error(`Missing methods: ${missing.join(", ")}`)
+            return {
+              methods: Object.keys(injector).sort(),
+              relativeMoveMethodPresent: typeof injector.injectMouseMove === "function",
+            }
+          })
+          await step("destroy()", async () => {
+            injector.destroy()
+            return "called"
+          })
+
+          writeFileSync(outputFile, `${JSON.stringify(result, null, 2)}\n`)
+          console.log(JSON.stringify(result, null, 2))
+          process.exit(ok ? 0 : 1)
+          EOF
+
+          cp "$RUNNER_TEMP/record.sh" "$RUNNER_TEMP/vitest-summary.mjs" "$RUNNER_TEMP/smoke.mjs" "$EVIDENCE_DIR/scripts/"
+
+      - name: "Safety gate: native E2E must be disabled"
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          require_pass pre native-e2e-disabled bash -c 'if [ -n "${INJECT_NATIVE_E2E+x}" ]; then echo "INJECT_NATIVE_E2E is set; live input injection is prohibited"; exit 1; fi; echo "INJECT_NATIVE_E2E is not set"'
+
+      - name: Checkout inject library at the exact target commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: imxade/inject
+          ref: b45f448e499d45ccabd3ef32a038fb09d6454605
+          path: inject
+          persist-credentials: false
+
+      - name: "Hard gate: verify checked-out commit"
+        working-directory: inject
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          require_pass pre source-commit bash -c '
+            actual="$(git rev-parse HEAD)"
+            echo "git rev-parse HEAD: $actual"
+            echo "expected:           $TARGET_SHA"
+            echo "origin:             $(git remote get-url origin)"
+            git log -1 --format="subject:            %s%ncommitter date:     %cI"
+            [ "$actual" = "$TARGET_SHA" ]'
+          require_pass pre checkout-pristine bash -c 'status="$(git status --porcelain)"; echo "${status:-clean}"; [ -z "$status" ]'
+          git rev-parse HEAD > "$EVIDENCE_DIR/source-commit.txt"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: "Stage A: environment verification"
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          record A macos-version yes sw_vers
+          record A kernel no uname -a
+          record A arch-is-arm64 yes bash -c 'a="$(uname -m)"; echo "uname -m: $a"; [ "$a" = arm64 ]'
+          record A node-arch-is-arm64 yes bash -c 'a="$(node -p process.arch)"; echo "node process.arch: $a"; [ "$a" = arm64 ]'
+          record A node-version yes bash -c 'v="$(node --version)"; echo "node: $v"; [[ "$v" == "v${EXPECTED_NODE_MAJOR}."* ]]'
+          record A npm-version yes npm --version
+          record A runner-image no bash -c 'echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset} RUNNER_OS=$RUNNER_OS RUNNER_ARCH=$RUNNER_ARCH"; sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize'
+          record A xcode no xcodebuild -version
+          record A xcode-select no xcode-select -p
+          record A swift no swift --version
+          record A library-path yes bash -c 'echo "INJECT_DIR=$INJECT_DIR"; test -f "$INJECT_DIR/package.json"'
+          record A target-commit yes bash -c 'h="$(git -C "$INJECT_DIR" rev-parse HEAD)"; echo "$h"; [ "$h" = "$TARGET_SHA" ]'
+
+      - name: "Stage B: dependency installation"
+        working-directory: inject
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          record B lockfile-absent-at-target no bash -c 'if [ -e package-lock.json ]; then echo "package-lock.json present at target commit"; exit 1; fi; echo "No package-lock.json at target commit; npm ci is not applicable"'
+          # `npm install` also runs the package's `prepare` script (`npm run build`).
+          record B npm-install yes npm install --no-audit --no-fund
+          record B npm-ls-all no bash -o pipefail -c 'npm ls --all | tee "$EVIDENCE_DIR/npm-ls-all.txt"'
+          record B process-versions yes bash -o pipefail -c 'node -p "JSON.stringify(process.versions, null, 2)" | tee "$EVIDENCE_DIR/process-versions.json"'
+          record B koffi-version no node -p "require('./node_modules/koffi/package.json').version"
+          if [ -f package-lock.json ]; then cp package-lock.json "$EVIDENCE_DIR/runner-generated-package-lock.json"; fi
+
+      - name: "Stage C: static checks and build"
+        working-directory: inject
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          record C scripts-present yes node -e 'const s = require("./package.json").scripts; for (const k of ["check", "typecheck", "build", "pack:check", "test"]) { if (!s[k]) { console.error("missing script: " + k); process.exit(1) } console.log(k + ": " + s[k]) }'
+          record C biome-check yes npm run check
+          record C typecheck yes npm run typecheck
+          record C build yes npm run build
+          record C pack-check yes npm run pack:check
+
+      - name: "Stage D: non-injecting automated tests"
+        working-directory: inject
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          record D native-e2e-gate-disabled yes bash -c 'if [ -n "${INJECT_NATIVE_E2E+x}" ]; then echo "INJECT_NATIVE_E2E is set"; exit 1; fi; echo "INJECT_NATIVE_E2E is not set"'
+          record D vitest yes env -u INJECT_NATIVE_E2E npm test -- --reporter=default --reporter=json "--outputFile.json=$EVIDENCE_DIR/vitest-results.json"
+          record D test-summary-and-e2e-skip yes node "$RUNNER_TEMP/vitest-summary.mjs" "$EVIDENCE_DIR/vitest-results.json" "$EVIDENCE_DIR/test-summary.json"
+
+      - name: "Stage E: non-injecting API smoke test"
+        working-directory: inject
+        run: |
+          source "$RUNNER_TEMP/record.sh"
+          record E smoke-static-check yes bash -c '! grep -nE "\.(inject[A-Za-z]*|post[A-Za-z]*)[[:space:]]*\(" "$RUNNER_TEMP/smoke.mjs" && echo "No inject*/post* call sites in smoke script"'
+          record E api-smoke yes env -u INJECT_NATIVE_E2E node "$RUNNER_TEMP/smoke.mjs" "$EVIDENCE_DIR/api-smoke.json"
+
+      - name: Build validation report
+        if: always()
+        run: |
+          mkdir -p "$EVIDENCE_DIR/logs"
+          if [ -d "$HOME/.npm/_logs" ]; then
+            mkdir -p "$EVIDENCE_DIR/logs/npm-debug"
+            cp "$HOME"/.npm/_logs/*.log "$EVIDENCE_DIR/logs/npm-debug/" 2>/dev/null || true
+          fi
+          results="$EVIDENCE_DIR/results.tsv"
+          report="$EVIDENCE_DIR/report.md"
+          {
+            echo "# macOS validation report: @imxade/inject v0.2.0"
+            echo
+            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "- Hosting repository/ref: $GITHUB_REPOSITORY $GITHUB_REF @ $GITHUB_SHA"
+            echo "- Runner: $RUNNER_OS/$RUNNER_ARCH, ImageOS=${ImageOS:-unknown}, ImageVersion=${ImageVersion:-unknown}"
+            echo "- macOS: $(sw_vers -productVersion 2>/dev/null || echo unknown) (build $(sw_vers -buildVersion 2>/dev/null || echo unknown)), uname -m: $(uname -m)"
+            echo "- Node.js: $(node --version 2>/dev/null || echo unavailable); npm: $(npm --version 2>/dev/null || echo unavailable)"
+            echo "- Library: $TARGET_REPOSITORY @ $(git -C "$INJECT_DIR" rev-parse HEAD 2>/dev/null || echo 'not checked out') (required $TARGET_SHA)"
+            echo
+            echo "## Command results"
+            echo
+            echo "| Stage | Check | Required | Exit | Status | Command |"
+            echo "|---|---|---|---|---|---|"
+            if [ -f "$results" ]; then
+              tail -n +2 "$results" | while IFS=$'\t' read -r stage check required rc cmd; do
+                if [ "$rc" = 0 ]; then status=PASS; elif [ "$required" = yes ]; then status=FAIL; else status="WARN (informational)"; fi
+                echo "| $stage | $check | $required | $rc | $status | \`${cmd//|/\\|}\` |"
+              done
+            fi
+            echo
+            echo "## Stage coverage"
+            echo
+            for stage in pre A B C D E; do
+              if [ -f "$results" ] && awk -F'\t' -v s="$stage" 'NR > 1 && $1 == s { found = 1 } END { exit !found }' "$results"; then
+                fails="$(awk -F'\t' -v s="$stage" 'NR > 1 && $1 == s && $3 == "yes" && $4 != "0"' "$results" | wc -l | tr -d ' ')"
+                if [ "$fails" = 0 ]; then echo "- Stage $stage: PASS"; else echo "- Stage $stage: FAIL ($fails required check(s) failed)"; fi
+              else
+                echo "- Stage $stage: NOT RUN (job stopped earlier)"
+              fi
+            done
+            echo
+            echo "## Test summary"
+            echo
+            echo '```json'
+            if [ -f "$EVIDENCE_DIR/test-summary.json" ]; then node -e 'const s = require(process.argv[1]); delete s.files; console.log(JSON.stringify(s, null, 2))' "$EVIDENCE_DIR/test-summary.json" 2>/dev/null || cat "$EVIDENCE_DIR/test-summary.json"; else echo '"not produced"'; fi
+            echo '```'
+            echo
+            echo "## API smoke test"
+            echo
+            echo '```json'
+            if [ -f "$EVIDENCE_DIR/api-smoke.json" ]; then cat "$EVIDENCE_DIR/api-smoke.json"; else echo '"not produced"'; fi
+            echo '```'
+            echo
+            echo "## Native input injection"
+            echo
+            echo "- INJECT_NATIVE_E2E at report time: $([ -n "${INJECT_NATIVE_E2E+x}" ] && echo SET || echo 'not set')."
+            echo "- Native E2E files are collected by vitest but gated by describe.runIf; their per-test status is in test-summary.json (nativeE2E.executedNativeTests must be empty)."
+            echo "- The macOS native E2E npm script was not run and the Swift CGEventTap observer was not started."
+            echo "- The smoke test made no inject*/post* calls (see E/smoke-static-check). Its only native calls were CGMainDisplayID and CGDisplayPixelsWide/High via getMainDisplaySize(), which createInjector('darwin') also calls during construction."
+            echo "- No Accessibility or Input Monitoring permission was requested by this workflow."
+            echo
+            echo "## Limitations"
+            echo
+            echo "- No lockfile exists at the target commit; transitive dependencies resolved at run time (see runner-generated-package-lock.json and npm-ls-all.txt)."
+            echo "- Headless GitHub-hosted runner: display dimensions may be virtual or zero and are recorded, not classified."
+            echo "- This run does not validate live input delivery on macOS."
+          } > "$report"
+          cat "$report"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-validation-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Runs last so evidence is uploaded first; makes the job conclusion reflect required failures.
+      - name: Enforce required-stage results
+        if: always()
+        run: |
+          results="$EVIDENCE_DIR/results.tsv"
+          if [ ! -f "$results" ]; then
+            echo "::error::No results were recorded"
+            exit 1
+          fi
+          status=0
+          for stage in pre A B C D E; do
+            if ! awk -F'\t' -v s="$stage" 'NR > 1 && $1 == s { found = 1 } END { exit !found }' "$results"; then
+              echo "::error::Stage $stage did not run"
+              status=1
+            fi
+          done
+          failed="$(awk -F'\t' 'NR > 1 && $3 == "yes" && $4 != "0" { print $1 "/" $2 " (exit " $4 ")" }' "$results")"
+          if [ -n "$failed" ]; then
+            echo "::error::Required checks failed:"
+            echo "$failed"
+            status=1
+          fi
+          [ "$status" = 0 ] && echo "All required checks passed."
+          exit "$status"
